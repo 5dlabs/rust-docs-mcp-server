@@ -1,8 +1,8 @@
 use scraper::{Html, Selector};
+use std::collections::HashMap;
 use thiserror::Error;
 use reqwest;
 use tokio;
-use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Error)]
 pub enum DocLoaderError {
@@ -12,8 +12,6 @@ pub enum DocLoaderError {
     Selector(String),
     #[error("Parsing error: {0}")]
     Parsing(String),
-    #[error("Network error: {0}")]
-    Network(String),
 }
 
 // Simple struct to hold document content
@@ -23,52 +21,43 @@ pub struct Document {
     pub content: String,
 }
 
-// Result struct that includes version information
-#[derive(Debug)]
-pub struct LoadResult {
-    pub documents: Vec<Document>,
-    pub version: Option<String>,
-}
-
-/// Load documentation from docs.rs for a given crate
+/// Loads documentation for a crate from docs.rs
+/// This is a simplified version that doesn't require the cargo crate
 pub async fn load_documents_from_docs_rs(
     crate_name: &str,
-    _version: &str,
-    _features: Option<&Vec<String>>,
-    max_pages: Option<usize>,
-) -> Result<LoadResult, DocLoaderError> {
-    println!("Fetching documentation from docs.rs for crate: {}", crate_name);
+    _crate_version_req: &str, // We'll use latest version from docs.rs
+    _features: Option<&Vec<String>>, // Features not supported in this simple version
+) -> Result<Vec<Document>, DocLoaderError> {
+    let client = reqwest::Client::new();
 
+    // Start with the main crate page
     let base_url = format!("https://docs.rs/{}/latest/{}/", crate_name, crate_name);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| DocLoaderError::Network(e.to_string()))?;
+
+    eprintln!("Fetching documentation from docs.rs for crate: {}", crate_name);
 
     let mut documents = Vec::new();
-    let mut visited = HashSet::new();
-    let mut to_visit = VecDeque::new();
-    to_visit.push_back(base_url.clone());
-    let mut extracted_version = None;
+    let mut visited_urls = std::collections::HashSet::new();
+    let mut urls_to_visit = vec![base_url.clone()];
 
     // Define the CSS selector for the main content area
     let content_selector = Selector::parse("div.docblock, section.docblock, .rustdoc .docblock")
         .map_err(|e| DocLoaderError::Selector(e.to_string()))?;
 
-    let max_pages = max_pages.unwrap_or(200); // Default to 200 pages if not specified
+    // Limit the number of pages to avoid infinite loops
+    let max_pages = 50;
     let mut processed = 0;
 
-    while let Some(url) = to_visit.pop_front() {
+    while let Some(url) = urls_to_visit.pop() {
         if processed >= max_pages {
             eprintln!("Reached maximum page limit ({}), stopping", max_pages);
             break;
         }
 
-        if visited.contains(&url) {
+        if visited_urls.contains(&url) {
             continue;
         }
 
-        visited.insert(url.clone());
+        visited_urls.insert(url.clone());
         processed += 1;
 
         eprintln!("Processing page {}/{}: {}", processed, max_pages, url);
@@ -97,30 +86,6 @@ pub async fn load_documents_from_docs_rs(
 
         let document = Html::parse_document(&html_content);
 
-        // Extract version from the first page (usually in the header)
-        if extracted_version.is_none() && processed == 1 {
-            // Try to find version in the docs.rs header
-            // docs.rs shows version in format "crate-name 1.2.3"
-            if let Ok(version_selector) = Selector::parse(".version") {
-                if let Some(version_elem) = document.select(&version_selector).next() {
-                    let version_text = version_elem.text().collect::<String>();
-                    extracted_version = Some(version_text.trim().to_string());
-                    eprintln!("Extracted version: {:?}", extracted_version);
-                }
-            }
-
-            // Alternative: Look in the title or URL path
-            if extracted_version.is_none() {
-                // The URL might contain version like /crate-name/1.2.3/
-                if let Some(version_match) = url.split('/').nth_back(2) {
-                    if version_match != "latest" && version_match.chars().any(|c| c.is_numeric()) {
-                        extracted_version = Some(version_match.to_string());
-                        eprintln!("Extracted version from URL: {:?}", extracted_version);
-                    }
-                }
-            }
-        }
-
         // Extract text content from documentation blocks
         let mut page_content = Vec::new();
         for element in document.select(&content_selector) {
@@ -147,12 +112,13 @@ pub async fn load_documents_from_docs_rs(
             });
         }
 
-        // Extract links to other documentation pages within the same crate
-        // Follow links for first 75% of pages to get deeper coverage
-        if processed < (max_pages * 3 / 4) {
-            let link_selector = Selector::parse("a").unwrap();
-            for link in document.select(&link_selector) {
-                if let Some(href) = link.value().attr("href") {
+        // Find links to other documentation pages (limited scope to avoid too many pages)
+        if processed < max_pages / 2 { // Only follow links for first half of pages
+            let link_selector = Selector::parse("a[href]")
+                .map_err(|e| DocLoaderError::Selector(e.to_string()))?;
+
+            for link_element in document.select(&link_selector) {
+                if let Some(href) = link_element.value().attr("href") {
                     // Only follow links that are relative and look like documentation
                     if href.starts_with("./") || href.starts_with("../") {
                         if let Ok(absolute_url) = reqwest::Url::parse(&url) {
@@ -160,8 +126,8 @@ pub async fn load_documents_from_docs_rs(
                                 let new_url_str = new_url.to_string();
                                 if new_url_str.contains("docs.rs") &&
                                    new_url_str.contains(crate_name) &&
-                                   !visited.contains(&new_url_str) {
-                                    to_visit.push_back(new_url_str);
+                                   !visited_urls.contains(&new_url_str) {
+                                    urls_to_visit.push(new_url_str);
                                 }
                             }
                         }
@@ -175,30 +141,17 @@ pub async fn load_documents_from_docs_rs(
     }
 
     eprintln!("Finished loading {} documents from docs.rs", documents.len());
-    Ok(LoadResult {
-        documents,
-        version: extracted_version,
-    })
+    Ok(documents)
 }
 
-/// Synchronous wrapper that uses current tokio runtime
+/// Synchronous wrapper that uses tokio runtime
 pub fn load_documents(
     crate_name: &str,
     crate_version_req: &str,
     features: Option<&Vec<String>>,
-) -> Result<LoadResult, DocLoaderError> {
-    // Check if we're already in a tokio runtime
-    if tokio::runtime::Handle::try_current().is_ok() {
-        // We're in a runtime, but we can't use block_on.
-        // We need to make this function async or use a different approach.
-        // For now, let's return an error suggesting the async version
-        return Err(DocLoaderError::Parsing(
-            "Cannot run synchronous load_documents from within async context. Use load_documents_from_docs_rs directly.".to_string()
-        ));
-    }
-
+) -> Result<Vec<Document>, DocLoaderError> {
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| DocLoaderError::Parsing(format!("Failed to create tokio runtime: {}", e)))?;
 
-    rt.block_on(load_documents_from_docs_rs(crate_name, crate_version_req, features, None))
+    rt.block_on(load_documents_from_docs_rs(crate_name, crate_version_req, features))
 }

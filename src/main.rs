@@ -1,63 +1,41 @@
-// Declare modules (keep doc_loader, embeddings, error)
+// Declare modules
+mod database;
 mod doc_loader;
 mod embeddings;
 mod error;
-mod server; // Keep server module as RustDocsServer is defined there
+mod server;
 
 // Use necessary items from modules and crates
 use crate::{
+    database::Database,
     doc_loader::Document,
-    embeddings::{generate_embeddings, CachedDocumentEmbedding, OPENAI_CLIENT},
+    embeddings::OPENAI_CLIENT,
     error::ServerError,
-    server::RustDocsServer, // Import the updated RustDocsServer
+    server::RustDocsServer,
 };
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
-use bincode::config;
-use cargo::core::PackageIdSpec;
-use clap::Parser; // Import clap Parser
-use ndarray::Array1;
-// Import rmcp items needed for the new approach
+use clap::Parser;
+use std::env;
 use rmcp::{
-    transport::io::stdio, // Use the standard stdio transport
-    ServiceExt,           // Import the ServiceExt trait for .serve() and .waiting()
+    transport::io::stdio,
+    ServiceExt,
 };
-use std::{
-    collections::hash_map::DefaultHasher,
-    env,
-    fs::{self, File},
-    hash::{Hash, Hasher}, // Import hashing utilities
-    io::BufReader,
-    path::PathBuf,
-};
-#[cfg(not(target_os = "windows"))]
-use xdg::BaseDirectories;
-
-// --- CLI Argument Parsing ---
+use futures::future::try_join_all;
+use std::collections::HashMap;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "Rust documentation MCP server using PostgreSQL vector database", long_about = None)]
 struct Cli {
-    /// The package ID specification (e.g., "serde@^1.0", "tokio").
-    #[arg()] // Positional argument
-    package_spec: String,
+    /// The crate names to serve documentation for (space-separated)
+    crate_names: Vec<String>,
 
-    /// Optional features to enable for the crate when generating documentation.
-    #[arg(short = 'F', long, value_delimiter = ',', num_args = 0..)] // Allow multiple comma-separated values
-    features: Option<Vec<String>>,
-}
+    /// List all available crates in the database
+    #[arg(short, long)]
+    list: bool,
 
-// Helper function to create a stable hash from features
-fn hash_features(features: &Option<Vec<String>>) -> String {
-    features
-        .as_ref()
-        .map(|f| {
-            let mut sorted_features = f.clone();
-            sorted_features.sort_unstable(); // Sort for consistent hashing
-            let mut hasher = DefaultHasher::new();
-            sorted_features.hash(&mut hasher);
-            format!("{:x}", hasher.finish()) // Return hex representation of hash
-        })
-        .unwrap_or_else(|| "no_features".to_string()) // Use a specific string if no features
+    /// Load all available crates from the database
+    #[arg(short, long)]
+    all: bool,
 }
 
 #[tokio::main]
@@ -65,123 +43,89 @@ async fn main() -> Result<(), ServerError> {
     // Load .env file if present
     dotenvy::dotenv().ok();
 
-    // --- Parse CLI Arguments ---
+    // Parse CLI arguments
     let cli = Cli::parse();
-    let specid_str = cli.package_spec.trim().to_string(); // Trim whitespace
-    let features = cli.features.map(|f| {
-        f.into_iter().map(|s| s.trim().to_string()).collect() // Trim each feature
-    });
 
-    // Parse the specid string
-    let spec = PackageIdSpec::parse(&specid_str).map_err(|e| {
-        ServerError::Config(format!(
-            "Failed to parse package ID spec '{}': {}",
-            specid_str, e
-        ))
-    })?;
+    // Initialize database connection
+    eprintln!("🔌 Connecting to database...");
+    let db = Database::new().await?;
+    eprintln!("✅ Database connected successfully");
 
-    let crate_name = spec.name().to_string();
-    let crate_version_req = spec
-        .version()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "*".to_string());
-
-    eprintln!(
-        "Target Spec: {}, Parsed Name: {}, Version Req: {}, Features: {:?}",
-        specid_str, crate_name, crate_version_req, features
-    );
-
-    // --- Determine Paths (incorporating features) ---
-
-    // Sanitize the version requirement string
-    let sanitized_version_req = crate_version_req
-        .replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '-', "_");
-
-    // Generate a stable hash for the features to use in the path
-    let features_hash = hash_features(&features);
-
-    // Construct the relative path component including features hash
-    let embeddings_relative_path = PathBuf::from(&crate_name)
-        .join(&sanitized_version_req)
-        .join(&features_hash) // Add features hash as a directory level
-        .join("embeddings.bin");
-
-    #[cfg(not(target_os = "windows"))]
-    let embeddings_file_path = {
-        let xdg_dirs = BaseDirectories::with_prefix("rustdocs-mcp-server")
-            .map_err(|e| ServerError::Xdg(format!("Failed to get XDG directories: {}", e)))?;
-        xdg_dirs
-            .place_data_file(embeddings_relative_path)
-            .map_err(ServerError::Io)?
-    };
-
-    #[cfg(target_os = "windows")]
-    let embeddings_file_path = {
-        let cache_dir = dirs::cache_dir().ok_or_else(|| {
-            ServerError::Config("Could not determine cache directory on Windows".to_string())
-        })?;
-        let app_cache_dir = cache_dir.join("rustdocs-mcp-server");
-        // Ensure the base app cache directory exists
-        fs::create_dir_all(&app_cache_dir).map_err(ServerError::Io)?;
-        app_cache_dir.join(embeddings_relative_path)
-    };
-
-    eprintln!("Cache file path: {:?}", embeddings_file_path);
-
-    // --- Try Loading Embeddings and Documents from Cache ---
-    let mut loaded_from_cache = false;
-    let mut loaded_embeddings: Option<Vec<(String, Array1<f32>)>> = None;
-    let mut loaded_documents_from_cache: Option<Vec<Document>> = None;
-
-    if embeddings_file_path.exists() {
-        eprintln!(
-            "Attempting to load cached data from: {:?}",
-            embeddings_file_path
-        );
-        match File::open(&embeddings_file_path) {
-            Ok(file) => {
-                let reader = BufReader::new(file);
-                match bincode::decode_from_reader::<Vec<CachedDocumentEmbedding>, _, _>(
-                    reader,
-                    config::standard(),
-                ) {
-                    Ok(cached_data) => {
-                        eprintln!(
-                            "Successfully loaded {} items from cache. Separating data...",
-                            cached_data.len()
-                        );
-                        let mut embeddings = Vec::with_capacity(cached_data.len());
-                        let mut documents = Vec::with_capacity(cached_data.len());
-                        for item in cached_data {
-                            embeddings.push((item.path.clone(), Array1::from(item.vector)));
-                            documents.push(Document {
-                                path: item.path,
-                                content: item.content,
-                            });
-                        }
-                        loaded_embeddings = Some(embeddings);
-                        loaded_documents_from_cache = Some(documents);
-                        loaded_from_cache = true;
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to decode cache file: {}. Will regenerate.", e);
-                    }
-                }
-            }
-            Err(e) => {
-                eprintln!("Failed to open cache file: {}. Will regenerate.", e);
+    // Handle list command
+    if cli.list {
+        let stats = db.get_crate_stats().await?;
+        if stats.is_empty() {
+            println!("No crates found in database.");
+            println!("Use the 'populate_db' tool to add crates first:");
+            println!("  cargo run --bin populate_db -- <crate_name>");
+        } else {
+            println!("{:<20} {:<15} {:<10} {:<10} {:<20}", "Crate", "Version", "Docs", "Tokens", "Last Updated");
+            println!("{:-<80}", "");
+            for stat in stats {
+                println!(
+                    "{:<20} {:<15} {:<10} {:<10} {:<20}",
+                    stat.name,
+                    stat.version.unwrap_or_else(|| "N/A".to_string()),
+                    stat.total_docs,
+                    stat.total_tokens,
+                    stat.last_updated.format("%Y-%m-%d %H:%M")
+                );
             }
         }
-    } else {
-        eprintln!("Cache file not found. Will generate.");
+        return Ok(());
     }
 
-    // --- Generate or Use Loaded Embeddings ---
-    let mut generated_tokens: Option<usize> = None;
-    let mut generation_cost: Option<f64> = None;
-    let mut documents_for_server: Vec<Document> = loaded_documents_from_cache.unwrap_or_default();
+    // Determine which crates to load
+    let crate_names = if cli.all {
+        eprintln!("Loading all available crates from database...");
+        let stats = db.get_crate_stats().await?;
+        if stats.is_empty() {
+            eprintln!("No crates found in database. Use 'populate_db' to add some first.");
+            return Ok(());
+        }
+        stats.into_iter().map(|stat| stat.name).collect()
+    } else if cli.crate_names.is_empty() {
+        eprintln!("Error: Please specify crate names or use --all to load all crates");
+        eprintln!("Usage examples:");
+        eprintln!("  cargo run --bin rustdocs_mcp_server -- anyhow tokio serde");
+        eprintln!("  cargo run --bin rustdocs_mcp_server -- --all");
+        eprintln!("  cargo run --bin rustdocs_mcp_server -- --list");
+        return Err(ServerError::Config("No crate names specified".to_string()));
+    } else {
+        cli.crate_names
+    };
 
-    // --- Initialize OpenAI Client (needed for question embedding even if cache hit) ---
+    eprintln!("Target crates: {:?}", crate_names);
+
+    // Check if all crates exist in database
+    eprintln!("🔍 Checking if crates exist in database...");
+    let mut missing_crates = Vec::new();
+    for crate_name in &crate_names {
+        eprintln!("  Checking: {}", crate_name);
+        if !db.has_embeddings(crate_name).await? {
+            missing_crates.push(crate_name.clone());
+            eprintln!("  ❌ Missing: {}", crate_name);
+        } else {
+            eprintln!("  ✅ Found: {}", crate_name);
+        }
+    }
+
+    if !missing_crates.is_empty() {
+        eprintln!("Error: The following crates are not found in the database:");
+        for crate_name in &missing_crates {
+            eprintln!("  - {}", crate_name);
+        }
+        eprintln!("\nPlease populate them first using:");
+        for crate_name in &missing_crates {
+            eprintln!("  cargo run --bin populate_db -- --crate-name {}", crate_name);
+        }
+        eprintln!("\nOr see available crates with:");
+        eprintln!("  cargo run --bin rustdocs_mcp_server -- --list");
+        return Err(ServerError::Config(format!("Missing crates: {:?}", missing_crates)));
+    }
+
+    // Initialize OpenAI client (needed for query embedding)
+    eprintln!("🤖 Initializing OpenAI client...");
     let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
         let config = OpenAIConfig::new().with_api_base(api_base);
         OpenAIClient::with_config(config)
@@ -189,152 +133,120 @@ async fn main() -> Result<(), ServerError> {
         OpenAIClient::new()
     };
     OPENAI_CLIENT
-        .set(openai_client.clone()) // Clone the client for the OnceCell
+        .set(openai_client.clone())
         .expect("Failed to set OpenAI client");
+    eprintln!("✅ OpenAI client initialized");
 
-    let final_embeddings = match loaded_embeddings {
-        Some(embeddings) => {
-            eprintln!("Using embeddings and documents loaded from cache.");
-            embeddings
+        // Load documents and embeddings from database IN PARALLEL
+    eprintln!("🚀 Loading {} crates from database in parallel...", crate_names.len());
+    let start_time = std::time::Instant::now();
+
+    let load_tasks: Vec<_> = crate_names.iter().enumerate().map(|(i, crate_name)| {
+        let db = &db;
+        let crate_name = crate_name.clone();
+        let total = crate_names.len();
+        async move {
+            eprintln!("  📦 [{}/{}] Loading crate: {}", i + 1, total, crate_name);
+            let load_start = std::time::Instant::now();
+            let documents = db.get_crate_documents(&crate_name).await?;
+            let load_time = load_start.elapsed();
+            eprintln!("  ✅ [{}/{}] Loaded {} documents from {} in {:.2}s",
+                i + 1, total, documents.len(), crate_name, load_time.as_secs_f64());
+            Ok::<_, ServerError>((crate_name, documents))
         }
-        None => {
-            eprintln!("Proceeding with documentation loading and embedding generation.");
+    }).collect();
 
-            let _openai_api_key = env::var("OPENAI_API_KEY")
-                .map_err(|_| ServerError::MissingEnvVar("OPENAI_API_KEY".to_string()))?;
+    let loaded_crates = try_join_all(load_tasks).await?;
+    let total_load_time = start_time.elapsed();
 
-            eprintln!(
-                "Loading documents for crate: {} (Version Req: {}, Features: {:?})",
-                crate_name, crate_version_req, features
-            );
-            // Pass features to load_documents
-            let loaded_documents =
-                doc_loader::load_documents(&crate_name, &crate_version_req, features.as_ref())?; // Pass features here
-            eprintln!("Loaded {} documents.", loaded_documents.len());
-            documents_for_server = loaded_documents.clone();
+    // Convert to the format expected by the server
+    let mut all_documents = Vec::new();
+    let mut all_embeddings = Vec::new();
+    let mut crate_document_counts = HashMap::new();
 
-            eprintln!("Generating embeddings...");
-            let embedding_model: String = env::var("EMBEDDING_MODEL")
-                .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-            let (generated_embeddings, total_tokens) =
-                generate_embeddings(&openai_client, &loaded_documents, &embedding_model).await?;
-
-            let cost_per_million = 0.02;
-            let estimated_cost = (total_tokens as f64 / 1_000_000.0) * cost_per_million;
-            eprintln!(
-                "Embedding generation cost for {} tokens: ${:.6}",
-                total_tokens, estimated_cost
-            );
-            generated_tokens = Some(total_tokens);
-            generation_cost = Some(estimated_cost);
-
-            eprintln!(
-                "Saving generated documents and embeddings to: {:?}",
-                embeddings_file_path
-            );
-
-            let mut combined_cache_data: Vec<CachedDocumentEmbedding> = Vec::new();
-            let embedding_map: std::collections::HashMap<String, Array1<f32>> =
-                generated_embeddings.clone().into_iter().collect();
-
-            for doc in &loaded_documents {
-                if let Some(embedding_array) = embedding_map.get(&doc.path) {
-                    combined_cache_data.push(CachedDocumentEmbedding {
-                        path: doc.path.clone(),
-                        content: doc.content.clone(),
-                        vector: embedding_array.to_vec(),
-                    });
-                } else {
-                    eprintln!(
-                        "Warning: Embedding not found for document path: {}. Skipping from cache.",
-                        doc.path
-                    );
-                }
-            }
-
-            match bincode::encode_to_vec(&combined_cache_data, config::standard()) {
-                Ok(encoded_bytes) => {
-                    if let Some(parent_dir) = embeddings_file_path.parent() {
-                        if !parent_dir.exists() {
-                            if let Err(e) = fs::create_dir_all(parent_dir) {
-                                eprintln!(
-                                    "Warning: Failed to create cache directory {}: {}",
-                                    parent_dir.display(),
-                                    e
-                                );
-                            }
-                        }
-                    }
-                    if let Err(e) = fs::write(&embeddings_file_path, encoded_bytes) {
-                        eprintln!("Warning: Failed to write cache file: {}", e);
-                    } else {
-                        eprintln!(
-                            "Cache saved successfully ({} items).",
-                            combined_cache_data.len()
-                        );
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to encode data for cache: {}", e);
-                }
-            }
-            generated_embeddings
+    for (crate_name, crate_documents) in loaded_crates {
+        if crate_documents.is_empty() {
+            eprintln!("Warning: No documents found for crate '{}'", crate_name);
+            continue;
         }
-    };
 
-    // --- Initialize and Start Server ---
-    eprintln!(
-        "Initializing server for crate: {} (Version Req: {}, Features: {:?})",
-        crate_name, crate_version_req, features
-    );
+        let doc_count = crate_documents.len();
+        crate_document_counts.insert(crate_name.clone(), doc_count);
 
-    let features_str = features
-        .as_ref()
-        .map(|f| format!(" Features: {:?}", f))
-        .unwrap_or_default();
+        for (doc_path, content, embedding) in crate_documents {
+            // Prefix the doc path with crate name to avoid conflicts
+            let prefixed_path = format!("{}/{}", crate_name, doc_path);
 
-    let startup_message = if loaded_from_cache {
+            all_documents.push(Document {
+                path: prefixed_path.clone(),
+                content,
+            });
+            all_embeddings.push((prefixed_path, embedding));
+        }
+    }
+
+    let total_docs = all_documents.len();
+    let total_embeddings = all_embeddings.len();
+
+    // Calculate total content size
+    let total_content_size: usize = all_documents.iter().map(|doc| doc.content.len()).sum();
+    let avg_doc_size = if total_docs > 0 { total_content_size / total_docs } else { 0 };
+
+    eprintln!("\n📊 Loading Summary:");
+    eprintln!("  ⏱️  Total loading time: {:.2}s", total_load_time.as_secs_f64());
+    eprintln!("  📚 Total documents: {}", total_docs);
+    eprintln!("  🧮 Total embeddings: {}", total_embeddings);
+    eprintln!("  📄 Total content: {:.1} KB (avg: {:.1} KB/doc)",
+        total_content_size as f64 / 1024.0, avg_doc_size as f64 / 1024.0);
+
+    let startup_message = if crate_names.len() == 1 {
         format!(
-            "Server for crate '{}' (Version Req: '{}'{}) initialized. Loaded {} embeddings from cache.",
-            crate_name, crate_version_req, features_str, final_embeddings.len()
+            "Server for crate '{}' initialized. Loaded {} documents from database.",
+            crate_names[0], total_docs
         )
     } else {
-        let tokens = generated_tokens.unwrap_or(0);
-        let cost = generation_cost.unwrap_or(0.0);
+        let crate_summary: Vec<String> = crate_document_counts
+            .iter()
+            .map(|(name, count)| format!("{} ({})", name, count))
+            .collect();
         format!(
-            "Server for crate '{}' (Version Req: '{}'{}) initialized. Generated {} embeddings for {} tokens (Est. Cost: ${:.6}).",
-            crate_name,
-            crate_version_req,
-            features_str,
-            final_embeddings.len(),
-            tokens,
-            cost
+            "Multi-crate server initialized. Loaded {} total documents from {} crates: {}",
+            total_docs,
+            crate_names.len(),
+            crate_summary.join(", ")
         )
     };
 
-    // Create the service instance using the updated ::new()
+    eprintln!("\n✅ {}", startup_message);
+
+    // Create the service instance with combined data
+    let combined_crate_name = if crate_names.len() == 1 {
+        crate_names[0].clone()
+    } else {
+        format!("multi-crate[{}]", crate_names.join(","))
+    };
+
     let service = RustDocsServer::new(
-        crate_name.clone(), // Pass crate_name directly
-        documents_for_server,
-        final_embeddings,
+        combined_crate_name.clone(),
+        all_documents,
+        all_embeddings,
         startup_message,
     )?;
 
-    // --- Use standard stdio transport and ServiceExt ---
     eprintln!("Rust Docs MCP server starting via stdio...");
 
-    // Serve the server using the ServiceExt trait and standard stdio transport
+    // Serve the server using stdio transport
     let server_handle = service.serve(stdio()).await.map_err(|e| {
         eprintln!("Failed to start server: {:?}", e);
-        ServerError::McpRuntime(e.to_string()) // Use the new McpRuntime variant
+        ServerError::McpRuntime(e.to_string())
     })?;
 
-    eprintln!("{} Docs MCP server running...", &crate_name);
+    eprintln!("Rust Docs MCP server running for: {}", combined_crate_name);
 
-    // Wait for the server to complete (e.g., stdin closed)
+    // Wait for the server to complete
     server_handle.waiting().await.map_err(|e| {
         eprintln!("Server encountered an error while running: {:?}", e);
-        ServerError::McpRuntime(e.to_string()) // Use the new McpRuntime variant
+        ServerError::McpRuntime(e.to_string())
     })?;
 
     eprintln!("Rust Docs MCP server stopped.");

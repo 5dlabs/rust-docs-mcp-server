@@ -26,4 +26,6 @@ pub enum ServerError {
     Xdg(String),
     #[error("MCP Runtime Error: {0}")]
     McpRuntime(String),
+    #[error("Database Error: {0}")]
+    Database(String),
 }
