@@ -1,0 +1,175 @@
+{
+  "rustdocs_binary_path": "rustdocs_mcp_server",
+  "crates": [
+    {
+      "name": "tokio",
+      "features": ["full"],
+      "enabled": true
+    },
+    {
+      "name": "serde",
+      "features": ["derive"],
+      "enabled": true
+    },
+    {
+      "name": "reqwest",
+      "features": ["json", "rustls-tls"],
+      "enabled": true
+    },
+    {
+      "name": "anyhow",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "thiserror",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tracing",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "uuid",
+      "features": ["v4", "serde"],
+      "enabled": true
+    },
+    {
+      "name": "chrono",
+      "features": ["serde"],
+      "enabled": true
+    },
+    {
+      "name": "rand",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "futures",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "async-trait",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tonic",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "prost",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "sqlx",
+      "features": ["runtime-tokio-rustls", "postgres", "uuid", "chrono"],
+      "enabled": true
+    },
+    {
+      "name": "redis",
+      "features": ["tokio-comp"],
+      "enabled": true
+    },
+    {
+      "name": "config",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tower",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tower-http",
+      "features": ["cors"],
+      "enabled": true
+    },
+    {
+      "name": "clap",
+      "features": ["derive"],
+      "enabled": true
+    },
+    {
+      "name": "toml",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "prometheus",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "serde_json",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "solana-sdk",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "solana-program",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "sqlx-postgres",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "anthropic",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tracing-subscriber",
+      "features": ["env-filter"],
+      "enabled": true
+    },
+    {
+      "name": "tempfile",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tokio-stream",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tokio-test",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tonic-build",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tonic-reflection",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tonic-web",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "wiremock",
+      "features": null,
+      "enabled": true
+    }
+  ]
+}
