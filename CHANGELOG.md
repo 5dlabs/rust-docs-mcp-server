@@ -1,6 +1,16 @@
 # CHANGELOG (rust-docs-mcp-server)
 
 
+<a name="1.0.0"></a>
+## [1.0.0](https://github.com/Govcraft/rust-docs-mcp-server/compare/v1.3.1...1.0.0)
+
+> 2025-06-22
+
+### Features
+
+* Add PostgreSQL vector database support with pgvector
+
+
 <a name="v1.3.1"></a>
 ## [v1.3.1](https://github.com/Govcraft/rust-docs-mcp-server/compare/v1.3.0...v1.3.1)
 
@@ -83,13 +93,19 @@
 
 
 <a name="v1.0.1"></a>
-## [v1.0.1](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.4.0...v1.0.1)
+## [v1.0.1](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.4...v1.0.1)
 
 > 2025-03-30
 
 ### Features
 
 * **ops:** fix changelog error
+
+
+<a name="v0.4"></a>
+## [v0.4](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.4.0...v0.4)
+
+> 2025-03-29
 
 
 <a name="v0.4.0"></a>
@@ -99,13 +115,7 @@
 
 
 <a name="v1.0.0"></a>
-## [v1.0.0](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.4...v1.0.0)
-
-> 2025-03-29
-
-
-<a name="v0.4"></a>
-## [v0.4](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.3.23...v0.4)
+## [v1.0.0](https://github.com/Govcraft/rust-docs-mcp-server/compare/v0.3.23...v1.0.0)
 
 > 2025-03-29
 
