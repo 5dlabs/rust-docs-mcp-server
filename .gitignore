@@ -12,3 +12,15 @@ doc
 debug/
 storage/
 .roo/
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.txt
+*.tmp
+*.bak
+
+# OS files
+.DS_Store
