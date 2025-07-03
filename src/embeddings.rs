@@ -1,6 +1,6 @@
 use crate::{doc_loader::Document, error::ServerError};
 use async_openai::{
-    config::OpenAIConfig, error::ApiError as OpenAIAPIErr, types::CreateEmbeddingRequestArgs,
+    config::OpenAIConfig, types::CreateEmbeddingRequestArgs,
     Client as OpenAIClient,
 };
 use ndarray::{Array1, ArrayView1};
@@ -8,13 +8,184 @@ use std::sync::OnceLock;
 use std::sync::Arc;
 use tiktoken_rs::cl100k_base;
 use futures::stream::{self, StreamExt};
+use serde::{Deserialize, Serialize};
 
-// Static OnceLock for the OpenAI client
-pub static OPENAI_CLIENT: OnceLock<OpenAIClient<OpenAIConfig>> = OnceLock::new();
+// Static OnceLock for the embedding client
+pub static EMBEDDING_CLIENT: OnceLock<Arc<dyn EmbeddingProvider + Send + Sync>> = OnceLock::new();
 
+/// Configuration for embedding providers
+#[derive(Debug, Clone)]
+pub enum EmbeddingConfig {
+    OpenAI {
+        client: OpenAIClient<OpenAIConfig>,
+        model: String,
+    },
+    VoyageAI {
+        api_key: String,
+        model: String,
+    },
+}
+
+/// Trait for embedding providers
+#[async_trait::async_trait]
+pub trait EmbeddingProvider {
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, usize), ServerError>;
+
+    fn get_model_name(&self) -> &str;
+}
+
+/// OpenAI embedding provider
+pub struct OpenAIEmbeddingProvider {
+    client: OpenAIClient<OpenAIConfig>,
+    model: String,
+}
+
+/// Voyage AI embedding provider
+pub struct VoyageAIEmbeddingProvider {
+    client: reqwest::Client,
+    api_key: String,
+    model: String,
+}
+
+/// Voyage AI API response structures
+#[derive(Deserialize)]
+struct VoyageEmbeddingResponse {
+    data: Vec<VoyageEmbeddingData>,
+    usage: VoyageUsage,
+}
+
+#[derive(Deserialize)]
+struct VoyageEmbeddingData {
+    embedding: Vec<f32>,
+    #[allow(dead_code)]
+    index: usize,
+}
+
+#[derive(Deserialize)]
+struct VoyageUsage {
+    total_tokens: usize,
+}
+
+#[derive(Serialize)]
+struct VoyageEmbeddingRequest {
+    input: Vec<String>,
+    model: String,
+    input_type: String,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for OpenAIEmbeddingProvider {
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, usize), ServerError> {
+        let request = CreateEmbeddingRequestArgs::default()
+            .model(&self.model)
+            .input(texts.to_vec())
+            .build()?;
+
+        let response = self.client.embeddings().create(request).await?;
+
+        let embeddings: Vec<Vec<f32>> = response.data
+            .into_iter()
+            .map(|data| data.embedding)
+            .collect();
+
+                let total_tokens = response.usage.total_tokens as usize;
+
+        Ok((embeddings, total_tokens))
+    }
+
+    fn get_model_name(&self) -> &str {
+        &self.model
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for VoyageAIEmbeddingProvider {
+    async fn generate_embeddings(
+        &self,
+        texts: &[String],
+    ) -> Result<(Vec<Vec<f32>>, usize), ServerError> {
+        let request = VoyageEmbeddingRequest {
+            input: texts.to_vec(),
+            model: self.model.clone(),
+            input_type: "document".to_string(), // Default to document type
+        };
+
+        let response = self
+            .client
+            .post("https://api.voyageai.com/v1/embeddings")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| ServerError::Network(format!("Voyage AI API request failed: {}", e)))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "Unknown error".to_string());
+            return Err(ServerError::Network(format!(
+                "Voyage AI API error {}: {}",
+                status,
+                error_text
+            )));
+        }
+
+        let voyage_response: VoyageEmbeddingResponse = response
+            .json()
+            .await
+            .map_err(|e| ServerError::Parsing(format!("Failed to parse Voyage AI response: {}", e)))?;
+
+        let embeddings: Vec<Vec<f32>> = voyage_response.data
+            .into_iter()
+            .map(|data| data.embedding)
+            .collect();
+
+        Ok((embeddings, voyage_response.usage.total_tokens))
+    }
+
+    fn get_model_name(&self) -> &str {
+        &self.model
+    }
+}
+
+impl OpenAIEmbeddingProvider {
+    pub fn new(client: OpenAIClient<OpenAIConfig>, model: String) -> Self {
+        Self { client, model }
+    }
+}
+
+impl VoyageAIEmbeddingProvider {
+    pub fn new(api_key: String, model: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key,
+            model,
+        }
+    }
+}
+
+/// Initialize the embedding provider based on configuration
+pub fn initialize_embedding_provider(config: EmbeddingConfig) -> Arc<dyn EmbeddingProvider + Send + Sync> {
+    match config {
+        EmbeddingConfig::OpenAI { client, model } => {
+            Arc::new(OpenAIEmbeddingProvider::new(client, model))
+        }
+        EmbeddingConfig::VoyageAI { api_key, model } => {
+            Arc::new(VoyageAIEmbeddingProvider::new(api_key, model))
+        }
+    }
+}
 
 use bincode::{Encode, Decode};
-use serde::{Serialize, Deserialize};
 
 // Define a struct containing path, content, and embedding for caching
 #[derive(Serialize, Deserialize, Debug, Encode, Decode)]
@@ -23,7 +194,6 @@ pub struct CachedDocumentEmbedding {
     pub content: String, // Add the extracted document content
     pub vector: Vec<f32>,
 }
-
 
 /// Calculates the cosine similarity between two vectors.
 pub fn cosine_similarity(v1: ArrayView1<f32>, v2: ArrayView1<f32>) -> f32 {
@@ -101,15 +271,17 @@ fn _chunk_content(content: &str, bpe: &tiktoken_rs::CoreBPE, token_limit: usize)
     chunks
 }
 
-
-
-/// Generates embeddings for a list of documents using the OpenAI API with chunking support.
+/// Generates embeddings for a list of documents using the configured provider with chunking support.
 #[allow(dead_code)]
 pub async fn generate_embeddings(
-    client: &OpenAIClient<OpenAIConfig>,
     documents: &[Document],
-    model: &str,
 ) -> Result<(Vec<(String, String, Array1<f32>)>, usize), ServerError> { // Return tuple: (path, content, embedding), total_tokens
+    // Get the embedding provider
+    let provider = EMBEDDING_CLIENT
+        .get()
+        .ok_or_else(|| ServerError::Internal("Embedding provider not initialized".to_string()))?;
+
+    let model = provider.get_model_name();
     eprintln!("Generating embeddings for {} documents using model '{}'...", documents.len(), model);
 
     // Get the tokenizer for the model and wrap in Arc
@@ -155,9 +327,8 @@ pub async fn generate_embeddings(
 
     let results = stream::iter(all_chunks.into_iter().enumerate())
         .map(|(chunk_index, (_doc_index, path, content))| {
-            // Clone client, model, and Arc<BPE> for the async block
-            let client = client.clone();
-            let model = model.to_string();
+            // Clone provider and other data for the async block
+            let provider = Arc::clone(&provider);
             let bpe = Arc::clone(&bpe); // Clone the Arc pointer
             let content_clone = content.clone(); // Clone content for returning
 
@@ -168,11 +339,6 @@ pub async fn generate_embeddings(
                 // Prepare input for this chunk
                 let inputs: Vec<String> = vec![content];
 
-                let request = CreateEmbeddingRequestArgs::default()
-                    .model(&model) // Use cloned model string
-                    .input(inputs)
-                    .build()?; // Propagates OpenAIError
-
                 if chunk_index % 10 == 0 || chunk_index == total_chunks - 1 {
                     eprintln!(
                         "    Processing chunk {}/{} ({} tokens): {}",
@@ -182,25 +348,20 @@ pub async fn generate_embeddings(
                         path
                     );
                 }
-                let response = client.embeddings().create(request).await?; // Propagates OpenAIError
 
-                if response.data.len() != 1 {
-                    return Err(ServerError::OpenAI(
-                        async_openai::error::OpenAIError::ApiError(OpenAIAPIErr {
-                            message: format!(
-                                "Mismatch in response length for chunk {}. Expected 1, got {}.",
-                                chunk_index + 1, response.data.len()
-                            ),
-                            r#type: Some("sdk_error".to_string()),
-                            param: None,
-                            code: None,
-                        }),
-                    ));
+                // Use the provider to generate embeddings
+                let (embeddings, _tokens) = provider.generate_embeddings(&inputs).await?;
+
+                if embeddings.len() != 1 {
+                    return Err(ServerError::Internal(format!(
+                        "Mismatch in response length for chunk {}. Expected 1, got {}.",
+                        chunk_index + 1, embeddings.len()
+                    )));
                 }
 
                 // Process result
-                let embedding_data = response.data.first().unwrap(); // Safe unwrap due to check above
-                let embedding_array = Array1::from(embedding_data.embedding.clone());
+                let embedding_data = embeddings.into_iter().next().unwrap(); // Safe unwrap due to check above
+                let embedding_array = Array1::from(embedding_data);
                 // Return successful embedding with path, content, and token count
                 Ok((path, content_clone, embedding_array, token_count))
             }

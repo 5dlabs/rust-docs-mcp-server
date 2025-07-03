@@ -28,4 +28,10 @@ pub enum ServerError {
     McpRuntime(String),
     #[error("Database Error: {0}")]
     Database(String),
+    #[error("Internal Error: {0}")]
+    Internal(String),
+    #[error("Network Error: {0}")]
+    Network(String),
+    #[error("Parsing Error: {0}")]
+    Parsing(String),
 }

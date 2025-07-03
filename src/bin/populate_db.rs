@@ -1,7 +1,7 @@
 use rustdocs_mcp_server::{
     database::Database,
     doc_loader,
-    embeddings::{generate_embeddings, OPENAI_CLIENT},
+    embeddings::{generate_embeddings, EMBEDDING_CLIENT, EmbeddingConfig, initialize_embedding_provider},
     error::ServerError,
 };
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
@@ -35,6 +35,10 @@ struct Cli {
     /// Optional features to enable for the crate
     #[arg(short = 'F', long, value_delimiter = ',', num_args = 0..)]
     features: Option<Vec<String>>,
+
+    /// Maximum number of pages to crawl (default: 200)
+    #[arg(long, default_value_t = 200)]
+    max_pages: usize,
 }
 
 #[tokio::main]
@@ -84,24 +88,45 @@ async fn main() -> Result<(), ServerError> {
             return Ok(());
         }
 
-        // Initialize OpenAI client
-        let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
-            let config = OpenAIConfig::new().with_api_base(api_base);
-            OpenAIClient::with_config(config)
-        } else {
-            OpenAIClient::new()
+        // Initialize embedding provider (default to OpenAI for populate script)
+        let provider_type = env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+        let embedding_config = match provider_type.to_lowercase().as_str() {
+            "openai" => {
+                let model = env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-large".to_string());
+                let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
+                    let config = OpenAIConfig::new().with_api_base(api_base);
+                    OpenAIClient::with_config(config)
+                } else {
+                    OpenAIClient::new()
+                };
+                EmbeddingConfig::OpenAI { client: openai_client, model }
+            },
+            "voyage" => {
+                let api_key = env::var("VOYAGE_API_KEY")
+                    .map_err(|_| ServerError::MissingEnvVar("VOYAGE_API_KEY".to_string()))?;
+                let model = env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "voyage-3.5".to_string());
+                EmbeddingConfig::VoyageAI { api_key, model }
+            },
+            _ => {
+                return Err(ServerError::Config(format!(
+                    "Unsupported embedding provider: {}. Use 'openai' or 'voyage'",
+                    provider_type
+                )));
+            }
         };
-        OPENAI_CLIENT
-            .set(openai_client.clone())
-            .expect("Failed to set OpenAI client");
+
+        let provider = initialize_embedding_provider(embedding_config);
+        if EMBEDDING_CLIENT.set(provider).is_err() {
+            return Err(ServerError::Internal("Failed to set embedding provider".to_string()));
+        }
 
         // Initialize tokenizer for accurate token counting
         let bpe = tiktoken_rs::cl100k_base()
             .map_err(|e| ServerError::Tiktoken(e.to_string()))?;
 
-        println!("📥 Loading documentation for crate: {}", crate_name);
+        println!("📥 Loading documentation for crate: {} (max {} pages)", crate_name, cli.max_pages);
         let doc_start = std::time::Instant::now();
-        let load_result = doc_loader::load_documents_from_docs_rs(&crate_name, "*", cli.features.as_ref(), None).await?;
+        let load_result = doc_loader::load_documents_from_docs_rs(&crate_name, "*", cli.features.as_ref(), Some(cli.max_pages)).await?;
         let documents = load_result.documents;
         let crate_version = load_result.version;
         let doc_time = doc_start.elapsed();
@@ -137,9 +162,7 @@ async fn main() -> Result<(), ServerError> {
         // Generate embeddings
         println!("\n🧠 Generating embeddings...");
         let embedding_start = std::time::Instant::now();
-        let embedding_model = env::var("EMBEDDING_MODEL")
-            .unwrap_or_else(|_| "text-embedding-3-small".to_string());
-        let (embeddings, total_tokens) = generate_embeddings(&openai_client, &documents, &embedding_model).await?;
+        let (embeddings, total_tokens) = generate_embeddings(&documents).await?;
         let embedding_time = embedding_start.elapsed();
 
         let cost_per_million = 0.02;

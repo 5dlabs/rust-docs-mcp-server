@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS doc_embeddings (
     crate_name VARCHAR(255) NOT NULL, -- Denormalized for faster queries
     doc_path TEXT NOT NULL,
     content TEXT NOT NULL,
-    embedding vector(1536), -- OpenAI text-embedding-3-small dimension
+    embedding vector(3072), -- OpenAI text-embedding-3-large dimension
     token_count INTEGER,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(crate_name, doc_path)
@@ -27,16 +27,13 @@ CREATE TABLE IF NOT EXISTS doc_embeddings (
 CREATE INDEX IF NOT EXISTS idx_doc_embeddings_crate_name ON doc_embeddings(crate_name);
 CREATE INDEX IF NOT EXISTS idx_doc_embeddings_crate_id ON doc_embeddings(crate_id);
 
--- Index for vector similarity search using IVFFlat
--- This provides good performance for similarity searches
-CREATE INDEX IF NOT EXISTS idx_doc_embeddings_vector
-ON doc_embeddings
-USING ivfflat (embedding vector_cosine_ops)
-WITH (lists = 100); -- Adjust lists parameter based on data size
+-- Note: pgvector indexes (IVFFlat and HNSW) have a 2000 dimension limit
+-- For 3072 dimensions, we skip the index. Queries will still work but be slower.
+-- Consider upgrading pgvector or using 1536 dimensions if performance is critical.
 
 -- Function to search for similar documents
 CREATE OR REPLACE FUNCTION search_similar_docs(
-    query_embedding vector(1536),
+    query_embedding vector(3072),
     target_crate_name VARCHAR(255),
     limit_results INTEGER DEFAULT 5
 )

@@ -9,7 +9,7 @@ mod server;
 use crate::{
     database::Database,
     doc_loader::Document,
-    embeddings::OPENAI_CLIENT,
+    embeddings::{EMBEDDING_CLIENT, EmbeddingConfig, initialize_embedding_provider},
     error::ServerError,
     server::RustDocsServer,
 };
@@ -36,6 +36,14 @@ struct Cli {
     /// Load all available crates from the database
     #[arg(short, long)]
     all: bool,
+
+    /// Embedding provider to use (openai or voyage)
+    #[arg(long, default_value = "openai")]
+    embedding_provider: String,
+
+    /// Embedding model to use
+    #[arg(long)]
+    embedding_model: Option<String>,
 }
 
 #[tokio::main]
@@ -124,18 +132,43 @@ async fn main() -> Result<(), ServerError> {
         return Err(ServerError::Config(format!("Missing crates: {:?}", missing_crates)));
     }
 
-    // Initialize OpenAI client (needed for query embedding)
-    eprintln!("🤖 Initializing OpenAI client...");
-    let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
-        let config = OpenAIConfig::new().with_api_base(api_base);
-        OpenAIClient::with_config(config)
-    } else {
-        OpenAIClient::new()
+    // Initialize embedding provider (needed for query embedding)
+    let provider_name = cli.embedding_provider.to_lowercase();
+    eprintln!("🤖 Initializing {} embedding provider...", provider_name);
+
+    let embedding_config = match provider_name.as_str() {
+        "openai" => {
+            let model = cli.embedding_model.unwrap_or_else(|| "text-embedding-3-large".to_string());
+            let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
+                let config = OpenAIConfig::new().with_api_base(api_base);
+                OpenAIClient::with_config(config)
+            } else {
+                OpenAIClient::new()
+            };
+            EmbeddingConfig::OpenAI {
+                client: openai_client,
+                model,
+            }
+        },
+        "voyage" => {
+            let api_key = env::var("VOYAGE_API_KEY")
+                .map_err(|_| ServerError::MissingEnvVar("VOYAGE_API_KEY".to_string()))?;
+            let model = cli.embedding_model.unwrap_or_else(|| "voyage-3.5".to_string());
+            EmbeddingConfig::VoyageAI { api_key, model }
+        },
+        _ => {
+            return Err(ServerError::Config(format!(
+                "Unsupported embedding provider: {}. Use 'openai' or 'voyage'",
+                provider_name
+            )));
+        }
     };
-    OPENAI_CLIENT
-        .set(openai_client.clone())
-        .expect("Failed to set OpenAI client");
-    eprintln!("✅ OpenAI client initialized");
+
+    let provider = initialize_embedding_provider(embedding_config);
+    if EMBEDDING_CLIENT.set(provider).is_err() {
+        return Err(ServerError::Internal("Failed to set embedding provider".to_string()));
+    }
+    eprintln!("✅ {} embedding provider initialized", provider_name);
 
         // Load documents and embeddings from database IN PARALLEL
     eprintln!("🚀 Loading {} crates from database in parallel...", crate_names.len());
@@ -230,6 +263,7 @@ async fn main() -> Result<(), ServerError> {
         combined_crate_name.clone(),
         all_documents,
         all_embeddings,
+        db,
         startup_message,
     )?;
 

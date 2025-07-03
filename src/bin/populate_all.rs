@@ -1,7 +1,7 @@
 use rustdocs_mcp_server::{
     database::Database,
     doc_loader,
-    embeddings::{generate_embeddings, OPENAI_CLIENT},
+    embeddings::{generate_embeddings, EMBEDDING_CLIENT, EmbeddingConfig, initialize_embedding_provider},
     error::ServerError,
 };
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
@@ -64,16 +64,37 @@ async fn main() -> Result<(), ServerError> {
         return Ok(());
     }
 
-    // Initialize OpenAI client
-    let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
-        let config = OpenAIConfig::new().with_api_base(api_base);
-        OpenAIClient::with_config(config)
-    } else {
-        OpenAIClient::new()
+    // Initialize embedding provider (default to OpenAI for populate script)
+    let provider_type = env::var("EMBEDDING_PROVIDER").unwrap_or_else(|_| "openai".to_string());
+    let embedding_config = match provider_type.to_lowercase().as_str() {
+        "openai" => {
+            let model = env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-large".to_string());
+            let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
+                let config = OpenAIConfig::new().with_api_base(api_base);
+                OpenAIClient::with_config(config)
+            } else {
+                OpenAIClient::new()
+            };
+            EmbeddingConfig::OpenAI { client: openai_client, model }
+        },
+        "voyage" => {
+            let api_key = env::var("VOYAGE_API_KEY")
+                .map_err(|_| ServerError::MissingEnvVar("VOYAGE_API_KEY".to_string()))?;
+            let model = env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "voyage-3.5".to_string());
+            EmbeddingConfig::VoyageAI { api_key, model }
+        },
+        _ => {
+            return Err(ServerError::Config(format!(
+                "Unsupported embedding provider: {}. Use 'openai' or 'voyage'",
+                provider_type
+            )));
+        }
     };
-    OPENAI_CLIENT
-        .set(openai_client.clone())
-        .expect("Failed to set OpenAI client");
+
+    let provider = initialize_embedding_provider(embedding_config);
+    if EMBEDDING_CLIENT.set(provider).is_err() {
+        return Err(ServerError::Internal("Failed to set embedding provider".to_string()));
+    }
 
     let embedding_model = env::var("EMBEDDING_MODEL")
         .unwrap_or_else(|_| "text-embedding-3-small".to_string());
@@ -84,8 +105,7 @@ async fn main() -> Result<(), ServerError> {
     // Create tasks for parallel processing
     let tasks: Vec<_> = crates_to_populate.into_iter().enumerate().map(|(i, crate_config)| {
         let db = &db;
-        let openai_client = openai_client.clone();
-        let embedding_model = embedding_model.clone();
+        // Provider is now globally accessible, no cloning needed
         let crate_name = crate_config.name.clone();
         let features = crate_config.features.clone();
         let total = enabled_crates.len();
@@ -98,7 +118,7 @@ async fn main() -> Result<(), ServerError> {
                 &crate_name,
                 "*",
                 features.as_ref(),
-                None
+                Some(50)  // Use smaller page limit for batch processing
             ).await?;
             let documents = load_result.documents;
             let crate_version = load_result.version;
@@ -119,7 +139,7 @@ async fn main() -> Result<(), ServerError> {
             // Generate embeddings
             println!("🧠 [{}/{}] Generating embeddings for {}...", i + 1, total, crate_name);
             let embed_start = std::time::Instant::now();
-            let (embeddings, total_tokens) = generate_embeddings(&openai_client, &documents, &embedding_model).await?;
+            let (embeddings, total_tokens) = generate_embeddings(&documents).await?;
             let embed_time = embed_start.elapsed();
 
             let cost_per_million = 0.02;
@@ -147,6 +167,12 @@ async fn main() -> Result<(), ServerError> {
             }
 
             db.insert_embeddings_batch(crate_id, &crate_name, &batch_data).await?;
+
+            // Add delay between crates to be respectful to docs.rs
+            if i < total - 1 {
+                println!("⏱️  Waiting 2 seconds before next crate...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
 
             Ok((crate_name, embeddings.len(), estimated_cost))
         }

@@ -1,14 +1,16 @@
 use crate::{
+    database::Database,
     doc_loader::Document,
-    embeddings::{OPENAI_CLIENT, cosine_similarity},
+    embeddings::EMBEDDING_CLIENT,
     error::ServerError, // Keep ServerError for ::new()
 };
 use async_openai::{
+    config::OpenAIConfig,
     types::{
         ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-        CreateChatCompletionRequestArgs, CreateEmbeddingRequestArgs,
+        CreateChatCompletionRequestArgs,
     },
-    // Client as OpenAIClient, // Removed unused import
+    Client as OpenAIClient,
 };
 use ndarray::Array1;
 use rmcp::model::AnnotateAble; // Import trait for .no_annotation()
@@ -55,9 +57,10 @@ use tokio::sync::Mutex;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct QueryRustDocsArgs {
+    #[schemars(description = "The crate to search in (e.g., \"axum\", \"tokio\", \"serde\")")]
+    crate_name: String,
     #[schemars(description = "The specific question about the crate's API or usage.")]
     question: String,
-    // Removed crate_name field as it's implicit to the server instance
 }
 
 // --- Main Server Struct ---
@@ -68,6 +71,7 @@ pub struct RustDocsServer {
     crate_name: Arc<String>, // Use Arc for cheap cloning
     documents: Arc<Vec<Document>>,
     embeddings: Arc<Vec<(String, Array1<f32>)>>,
+    database: Arc<Database>, // Add database connection
     peer: Arc<Mutex<Option<Peer<RoleServer>>>>, // Uses tokio::sync::Mutex
     startup_message: Arc<Mutex<Option<String>>>, // Keep the message itself
     startup_message_sent: Arc<Mutex<bool>>,     // Flag to track if sent (using tokio::sync::Mutex)
@@ -80,6 +84,7 @@ impl RustDocsServer {
         crate_name: String,
         documents: Vec<Document>,
         embeddings: Vec<(String, Array1<f32>)>,
+        database: Database,
         startup_message: String,
     ) -> Result<Self, ServerError> {
         // Keep ServerError for potential future init errors
@@ -87,6 +92,7 @@ impl RustDocsServer {
             crate_name: Arc::new(crate_name),
             documents: Arc::new(documents),
             embeddings: Arc::new(embeddings),
+            database: Arc::new(database),
             peer: Arc::new(Mutex::new(None)), // Uses tokio::sync::Mutex
             startup_message: Arc::new(Mutex::new(Some(startup_message))), // Initialize message
             startup_message_sent: Arc::new(Mutex::new(false)), // Initialize flag to false
@@ -123,6 +129,65 @@ impl RustDocsServer {
     fn _create_resource_text(&self, uri: &str, name: &str) -> Resource {
         RawResource::new(uri, name.to_string()).no_annotation()
     }
+    
+    // Parse crate name from question
+    fn parse_crate_name_from_question(&self, question: &str) -> Option<String> {
+        // Common patterns for crate names in questions
+        let patterns = [
+            // "How do I use axum?" -> "axum"
+            r"(?i)\buse\s+(\w+)\b",
+            // "What is tokio?" -> "tokio"
+            r"(?i)\bwhat\s+is\s+(\w+)\b",
+            // "How does serde work?" -> "serde"
+            r"(?i)\bhow\s+does\s+(\w+)\s+work\b",
+            // "axum router" -> "axum"
+            r"^(\w+)\s+",
+            // "in axum" -> "axum"
+            r"(?i)\bin\s+(\w+)\b",
+            // "with tokio" -> "tokio"
+            r"(?i)\bwith\s+(\w+)\b",
+            // "using serde" -> "serde"
+            r"(?i)\busing\s+(\w+)\b",
+            // Direct crate name at beginning
+            r"^(\w+)(?:\s|$)",
+        ];
+        
+        // Common Rust crate names to look for
+        let known_crates = [
+            "axum", "tokio", "serde", "reqwest", "clap", "anyhow", "thiserror",
+            "tracing", "futures", "async-trait", "sqlx", "diesel", "rocket",
+            "actix", "actix-web", "warp", "hyper", "tonic", "prost", "bytes",
+            "rand", "chrono", "regex", "uuid", "base64", "hex", "sha2", "aes",
+            "rsa", "ed25519", "x25519", "chacha20", "poly1305", "argon2",
+        ];
+        
+        let question_lower = question.to_lowercase();
+        
+        // First check for exact known crate names
+        for crate_name in &known_crates {
+            if question_lower.contains(crate_name) {
+                return Some(crate_name.to_string());
+            }
+        }
+        
+        // Then try patterns
+        for pattern in &patterns {
+            if let Ok(re) = regex::Regex::new(pattern) {
+                if let Some(captures) = re.captures(question) {
+                    if let Some(matched) = captures.get(1) {
+                        let potential_crate = matched.as_str().to_lowercase();
+                        // Validate that it looks like a crate name
+                        if potential_crate.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') 
+                            && potential_crate.len() > 1 {
+                            return Some(potential_crate);
+                        }
+                    }
+                }
+            }
+        }
+        
+        None
+    }
 }
 
 // --- Tool Implementation ---
@@ -157,72 +222,115 @@ impl RustDocsServer {
             drop(sent_guard);
         }
 
-        // Argument validation for crate_name removed
-
+        let crate_name = &args.crate_name;
         let question = &args.question;
+        
+        // Use the explicitly provided crate name
+        let target_crate = crate_name;
 
         // Log received query via MCP
         self.send_log(
             LoggingLevel::Info,
             format!(
-                "Received query for crate '{}': {}",
-                self.crate_name, question
+                "Searching in crate '{}' for: {}",
+                target_crate, question
             ),
         );
 
         // --- Embedding Generation for Question ---
-        let client = OPENAI_CLIENT
+        let embedding_provider = EMBEDDING_CLIENT
             .get()
-            .ok_or_else(|| McpError::internal_error("OpenAI client not initialized", None))?;
+            .ok_or_else(|| McpError::internal_error("Embedding provider not initialized", None))?;
 
-        let embedding_model: String =
-            env::var("EMBEDDING_MODEL").unwrap_or_else(|_| "text-embedding-3-small".to_string());
-        let question_embedding_request = CreateEmbeddingRequestArgs::default()
-            .model(embedding_model)
-            .input(question.to_string())
-            .build()
-            .map_err(|e| {
-                McpError::internal_error(format!("Failed to build embedding request: {}", e), None)
-            })?;
-
-        let question_embedding_response = client
-            .embeddings()
-            .create(question_embedding_request)
+        // Generate embedding for the question using the configured provider
+        let (embeddings, _tokens) = embedding_provider
+            .generate_embeddings(&[question.to_string()])
             .await
-            .map_err(|e| McpError::internal_error(format!("OpenAI API error: {}", e), None))?;
+            .map_err(|e| McpError::internal_error(format!("Embedding API error: {}", e), None))?;
 
-        let question_embedding = question_embedding_response.data.first().ok_or_else(|| {
+        let question_embedding = embeddings.into_iter().next().ok_or_else(|| {
             McpError::internal_error("Failed to get embedding for question", None)
         })?;
 
-        let question_vector = Array1::from(question_embedding.embedding.clone());
+        let question_vector = Array1::from(question_embedding);
 
-        // --- Find Best Matching Document ---
-        let mut best_match: Option<(&str, f32)> = None;
-        for (path, doc_embedding) in self.embeddings.iter() {
-            let score = cosine_similarity(question_vector.view(), doc_embedding.view());
-            if best_match.is_none() || score > best_match.unwrap().1 {
-                best_match = Some((path, score));
-            }
-        }
-
+        // --- Search for similar documents using database ---
+        self.send_log(
+            LoggingLevel::Info,
+            format!("Performing vector search in database for crate '{}'", target_crate),
+        );
+        
+        let search_results = self.database
+            .search_similar_docs(target_crate, &question_vector, 3)
+            .await
+            .map_err(|e| {
+                self.send_log(
+                    LoggingLevel::Error,
+                    format!("Database search failed: {}", e),
+                );
+                McpError::internal_error(format!("Database search error: {}", e), None)
+            })?;
+        
         // --- Generate Response using LLM ---
-        let response_text = match best_match {
-            Some((best_path, _score)) => {
-                eprintln!("Best match found: {}", best_path);
-                let context_doc = self.documents.iter().find(|doc| doc.path == best_path);
+        let response_text = if !search_results.is_empty() {
+            let (best_path, best_content, best_score) = &search_results[0];
+            
+            self.send_log(
+                LoggingLevel::Info,
+                format!(
+                    "Found {} relevant documents via vector DB. Best match: {} (similarity: {:.3})",
+                    search_results.len(), best_path, best_score
+                ),
+            );
+            
+            // Combine top results for better context
+            let combined_context = if search_results.len() > 1 {
+                search_results
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (path, content, score))| {
+                        format!(
+                            "--- Document {} (similarity: {:.3}) ---\nPath: {}\n\n{}",
+                            i + 1, score, path, content
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            } else {
+                best_content.clone()
+            };
+            
+            // Check if this is an in-memory fallback or actual DB result
+            let source = if self.embeddings.is_empty() {
+                "vector database"
+            } else {
+                "vector database (with in-memory cache)"
+            };
+            
+            self.send_log(
+                LoggingLevel::Info,
+                format!("Using {} results from {} for LLM context", search_results.len(), source),
+            );
 
-                if let Some(doc) = context_doc {
+            {
+                    // Get OpenAI client for LLM chat completion (separate from embedding provider)
+                    let openai_client = if let Ok(api_base) = env::var("OPENAI_API_BASE") {
+                        let config = OpenAIConfig::new().with_api_base(api_base);
+                        OpenAIClient::with_config(config)
+                    } else {
+                        OpenAIClient::new()
+                    };
+
                     let system_prompt = format!(
                         "You are an expert technical assistant for the Rust crate '{}'. \
                          Answer the user's question based *only* on the provided context. \
                          If the context does not contain the answer, say so. \
                          Do not make up information. Be clear, concise, and comprehensive providing example usage code when possible.",
-                        self.crate_name
+                        target_crate
                     );
                     let user_prompt = format!(
                         "Context:\n---\n{}\n---\n\nQuestion: {}",
-                        doc.content, question
+                        combined_context, question
                     );
 
                     let llm_model: String = env::var("LLM_MODEL")
@@ -259,27 +367,48 @@ impl RustDocsServer {
                             )
                         })?;
 
-                    let chat_response = client.chat().create(chat_request).await.map_err(|e| {
+                    let chat_response = openai_client.chat().create(chat_request).await.map_err(|e| {
                         McpError::internal_error(format!("OpenAI chat API error: {}", e), None)
                     })?;
 
+                    self.send_log(
+                        LoggingLevel::Info,
+                        "Generating response using LLM based on vector DB results".to_string(),
+                    );
+                    
                     chat_response
                         .choices
                         .first()
                         .and_then(|choice| choice.message.content.clone())
                         .unwrap_or_else(|| "Error: No response from LLM.".to_string())
-                } else {
-                    "Error: Could not find content for best matching document.".to_string()
-                }
             }
-            None => "Could not find any relevant document context.".to_string(),
+        } else {
+            self.send_log(
+                LoggingLevel::Warning,
+                format!("No relevant documents found in vector DB for crate '{}'", target_crate),
+            );
+            "No relevant documentation found in the vector database for this query.".to_string()
         };
 
         // --- Format and Return Result ---
-        Ok(CallToolResult::success(vec![Content::text(format!(
-            "From {} docs: {}",
-            self.crate_name, response_text
-        ))]))
+        let final_response = if !search_results.is_empty() {
+            format!(
+                "From {} docs (via vector database search): {}",
+                target_crate, response_text
+            )
+        } else {
+            format!(
+                "From {} docs: {}",
+                target_crate, response_text
+            )
+        };
+        
+        self.send_log(
+            LoggingLevel::Info,
+            "Successfully generated response".to_string(),
+        );
+        
+        Ok(CallToolResult::success(vec![Content::text(final_response)]))
     }
 }
 

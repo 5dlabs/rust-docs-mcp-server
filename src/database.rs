@@ -4,13 +4,14 @@ use pgvector::Vector;
 use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 use std::env;
 
+#[derive(Clone)]
 pub struct Database {
     pool: PgPool,
 }
 
 impl Database {
     pub async fn new() -> Result<Self, ServerError> {
-        let database_url = env::var("DATABASE_URL")
+        let database_url = env::var("MCPDOCS_DATABASE_URL")
             .unwrap_or_else(|_| "postgresql://jonathonfritz@localhost/rust_docs_vectors".to_string());
 
         let pool = PgPoolOptions::new()
@@ -200,7 +201,8 @@ impl Database {
             .map(|row| {
                 let doc_path: String = row.get("doc_path");
                 let content: String = row.get("content");
-                let similarity: f32 = row.get("similarity");
+                let similarity: f64 = row.get("similarity");
+                let similarity = similarity as f32; // Convert to f32 for compatibility
                 (doc_path, content, similarity)
             })
             .collect())

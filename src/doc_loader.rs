@@ -3,6 +3,7 @@ use thiserror::Error;
 use reqwest;
 use tokio;
 use std::collections::{HashSet, VecDeque};
+use std::time::Duration;
 
 #[derive(Debug, Error)]
 pub enum DocLoaderError {
@@ -14,6 +15,8 @@ pub enum DocLoaderError {
     Parsing(String),
     #[error("Network error: {0}")]
     Network(String),
+    #[error("Rate limited: {0}")]
+    RateLimited(String),
 }
 
 // Simple struct to hold document content
@@ -73,24 +76,11 @@ pub async fn load_documents_from_docs_rs(
 
         eprintln!("Processing page {}/{}: {}", processed, max_pages, url);
 
-        // Fetch the page
-        let response = match client.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                eprintln!("Failed to fetch {}: {}", url, e);
-                continue;
-            }
-        };
-
-        if !response.status().is_success() {
-            eprintln!("HTTP error for {}: {}", url, response.status());
-            continue;
-        }
-
-        let html_content = match response.text().await {
+        // Fetch the page with retry logic
+        let html_content = match fetch_with_retry(&client, &url, 3).await {
             Ok(content) => content,
             Err(e) => {
-                eprintln!("Failed to read response body for {}: {}", url, e);
+                eprintln!("Failed to fetch {} after retries: {}", url, e);
                 continue;
             }
         };
@@ -141,37 +131,60 @@ pub async fn load_documents_from_docs_rs(
                 .unwrap_or(&url)
                 .to_string();
 
+            eprintln!("  -> Extracted content from: {} ({} blocks, {} chars)",
+                     relative_path, page_content.len(), page_content.join("\n\n").len());
+
             documents.push(Document {
                 path: relative_path,
                 content: page_content.join("\n\n"),
             });
+        } else {
+            eprintln!("  -> No content extracted from: {}", url);
         }
 
         // Extract links to other documentation pages within the same crate
         // Follow links for first 75% of pages to get deeper coverage
         if processed < (max_pages * 3 / 4) {
             let link_selector = Selector::parse("a").unwrap();
+            let mut found_links = 0;
+            let mut added_links = 0;
+
             for link in document.select(&link_selector) {
                 if let Some(href) = link.value().attr("href") {
-                    // Only follow links that are relative and look like documentation
-                    if href.starts_with("./") || href.starts_with("../") {
+                    found_links += 1;
+
+                    // Follow various types of relative links
+                    let should_follow = href.starts_with("./") ||
+                                       href.starts_with("../") ||
+                                       // Add support for simple relative paths
+                                       (!href.starts_with("http") &&
+                                        !href.starts_with("#") &&
+                                        !href.starts_with("/") &&
+                                        href.ends_with(".html"));
+
+                    if should_follow {
                         if let Ok(absolute_url) = reqwest::Url::parse(&url) {
                             if let Ok(new_url) = absolute_url.join(href) {
                                 let new_url_str = new_url.to_string();
                                 if new_url_str.contains("docs.rs") &&
                                    new_url_str.contains(crate_name) &&
                                    !visited.contains(&new_url_str) {
-                                    to_visit.push_back(new_url_str);
+                                    to_visit.push_back(new_url_str.clone());
+                                    added_links += 1;
+                                    if added_links <= 5 { // Only show first 5 for brevity
+                                        eprintln!("  -> Adding link: {}", href);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
+            eprintln!("  Found {} links, added {} new ones to visit", found_links, added_links);
         }
 
-        // Add a small delay to be respectful to docs.rs
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        // Add a longer delay to be respectful to docs.rs and avoid rate limiting
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     eprintln!("Finished loading {} documents from docs.rs", documents.len());
@@ -201,4 +214,59 @@ pub fn load_documents(
         .map_err(|e| DocLoaderError::Parsing(format!("Failed to create tokio runtime: {}", e)))?;
 
     rt.block_on(load_documents_from_docs_rs(crate_name, crate_version_req, features, None))
+}
+
+/// Fetch a URL with retry logic and rate limiting
+async fn fetch_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    max_retries: usize,
+) -> Result<String, DocLoaderError> {
+    let mut attempts = 0;
+    let mut delay = Duration::from_millis(1000); // Start with 1 second
+
+    loop {
+        match client.get(url).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    match response.text().await {
+                        Ok(text) => return Ok(text),
+                        Err(e) => {
+                            eprintln!("Failed to read response body for {}: {}", url, e);
+                            if attempts >= max_retries {
+                                return Err(DocLoaderError::Http(e));
+                            }
+                        }
+                    }
+                } else if response.status() == 429 {
+                    // Rate limited
+                    eprintln!("Rate limited for {}, waiting {:?} before retry {}/{}",
+                             url, delay, attempts + 1, max_retries + 1);
+                    if attempts >= max_retries {
+                        return Err(DocLoaderError::RateLimited(
+                            format!("Rate limited after {} attempts", attempts + 1)
+                        ));
+                    }
+                } else {
+                    eprintln!("HTTP error for {}: {}", url, response.status());
+                    if attempts >= max_retries {
+                        return Err(DocLoaderError::Network(
+                            format!("HTTP {}", response.status())
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("Network error for {}: {}", url, e);
+                if attempts >= max_retries {
+                    return Err(DocLoaderError::Http(e));
+                }
+            }
+        }
+
+        // Wait before retrying with exponential backoff
+        tokio::time::sleep(delay).await;
+        delay = std::cmp::min(delay * 2, Duration::from_secs(30)); // Cap at 30 seconds
+        attempts += 1;
+    }
 }

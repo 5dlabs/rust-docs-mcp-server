@@ -170,6 +170,136 @@
       "name": "wiremock",
       "features": null,
       "enabled": true
+    },
+    {
+      "name": "cargo-udeps",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "flamegraph",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "cargo-release",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "mdbook",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "mcp-core",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "axum",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "hyper",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "atomicwrites",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "tokio-tungstenite",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "futures-util",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "port-check",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "http",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "kube",
+      "features": ["runtime", "derive", "client", "ws"],
+      "enabled": true
+    },
+    {
+      "name": "k8s-openapi",
+      "features": ["v1_30"],
+      "enabled": true
+    },
+    {
+      "name": "serde_yaml",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "opentelemetry",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "opentelemetry-otlp",
+      "features": ["tonic"],
+      "enabled": true
+    },
+    {
+      "name": "opentelemetry_sdk",
+      "features": ["rt-tokio"],
+      "enabled": true
+    },
+    {
+      "name": "tracing-opentelemetry",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "dialoguer",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "indicatif",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "colored",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "eventsource-client",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "regex",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "handlebars",
+      "features": null,
+      "enabled": true
+    },
+    {
+      "name": "mockall",
+      "features": null,
+      "enabled": true
     }
   ]
 }
