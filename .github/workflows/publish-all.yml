@@ -154,12 +154,24 @@ jobs:
       
       - name: Prepare binaries directory
         run: |
-          mkdir -p binaries
+          mkdir -p binaries/linux/amd64
+          mkdir -p binaries/linux/arm64
+          
           # Move binaries to correct structure
-          cp -r binaries-temp/docker-binary-x86_64-unknown-linux-gnu/* binaries/linux/amd64/ || true
-          cp -r binaries-temp/docker-binary-aarch64-unknown-linux-gnu/* binaries/linux/arm64/ || true
-          chmod +x binaries/linux/*/http_server
-          ls -la binaries/
+          if [ -d "binaries-temp/docker-binary-x86_64-unknown-linux-gnu" ]; then
+            cp -r binaries-temp/docker-binary-x86_64-unknown-linux-gnu/* binaries/linux/amd64/
+          fi
+          
+          if [ -d "binaries-temp/docker-binary-aarch64-unknown-linux-gnu" ]; then
+            cp -r binaries-temp/docker-binary-aarch64-unknown-linux-gnu/* binaries/linux/arm64/
+          fi
+          
+          # Make binaries executable
+          find binaries -name http_server -type f -exec chmod +x {} \;
+          
+          # List directory structure for debugging
+          echo "Binaries directory structure:"
+          find binaries -type f -ls
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
