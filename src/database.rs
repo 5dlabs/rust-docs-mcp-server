@@ -302,6 +302,24 @@ impl Database {
             })
             .collect())
     }
+
+    /// Count documents for a specific crate
+    pub async fn count_crate_documents(&self, crate_name: &str) -> Result<usize, ServerError> {
+        let result = sqlx::query(
+            r#"
+            SELECT COUNT(*) as count
+            FROM doc_embeddings
+            WHERE crate_name = $1
+            "#
+        )
+        .bind(crate_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| ServerError::Database(format!("Failed to count crate documents: {}", e)))?;
+
+        let count: i64 = result.get("count");
+        Ok(count as usize)
+    }
 }
 
 #[derive(Debug)]

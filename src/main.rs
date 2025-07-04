@@ -8,11 +8,11 @@ mod server;
 // Use necessary items from modules and crates
 use crate::{
     database::Database,
-    doc_loader::Document,
     embeddings::{EMBEDDING_CLIENT, EmbeddingConfig, initialize_embedding_provider},
     error::ServerError,
     server::RustDocsServer,
 };
+use serde::{Deserialize, Serialize};
 use async_openai::{Client as OpenAIClient, config::OpenAIConfig};
 use clap::Parser;
 use std::env;
@@ -20,8 +20,24 @@ use rmcp::{
     transport::io::stdio,
     ServiceExt,
 };
-use futures::future::try_join_all;
+
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProxyConfig {
+    crates: Vec<CrateConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CrateConfig {
+    name: String,
+    features: Option<Vec<String>>,
+    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_docs: Option<usize>,
+}
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Rust documentation MCP server using PostgreSQL vector database", long_about = None)]
@@ -170,81 +186,106 @@ async fn main() -> Result<(), ServerError> {
     }
     eprintln!("✅ {} embedding provider initialized", provider_name);
 
-        // Load documents and embeddings from database IN PARALLEL
-    eprintln!("🚀 Loading {} crates from database in parallel...", crate_names.len());
-    let start_time = std::time::Instant::now();
+    // Check for automatic backfill requirements
+    if Path::new("proxy-config.json").exists() {
+        eprintln!("📋 Checking proxy-config.json for automatic backfill requirements...");
+        
+        let config_content = fs::read_to_string("proxy-config.json")
+            .map_err(|e| ServerError::Config(format!("Failed to read proxy-config.json: {}", e)))?;
+        
+        let config: ProxyConfig = serde_json::from_str(&config_content)
+            .map_err(|e| ServerError::Config(format!("Failed to parse proxy-config.json: {}", e)))?;
 
-    let load_tasks: Vec<_> = crate_names.iter().enumerate().map(|(i, crate_name)| {
-        let db = &db;
-        let crate_name = crate_name.clone();
-        let total = crate_names.len();
-        async move {
-            eprintln!("  📦 [{}/{}] Loading crate: {}", i + 1, total, crate_name);
-            let load_start = std::time::Instant::now();
-            let documents = db.get_crate_documents(&crate_name).await?;
-            let load_time = load_start.elapsed();
-            eprintln!("  ✅ [{}/{}] Loaded {} documents from {} in {:.2}s",
-                i + 1, total, documents.len(), crate_name, load_time.as_secs_f64());
-            Ok::<_, ServerError>((crate_name, documents))
+        let mut needs_backfill = Vec::new();
+        
+        for crate_config in &config.crates {
+            if !crate_config.enabled {
+                continue;
+            }
+            
+            // Only check crates that we're actually serving
+            if !crate_names.contains(&crate_config.name) {
+                continue;
+            }
+            
+            if let Some(expected_docs) = crate_config.expected_docs {
+                let current_count = db.count_crate_documents(&crate_config.name).await?;
+                
+                if current_count < expected_docs {
+                    needs_backfill.push((
+                        crate_config.name.clone(),
+                        current_count,
+                        expected_docs,
+                        crate_config.features.clone(),
+                    ));
+                    eprintln!("  ⚠️  {}: {} docs in DB < {} expected", 
+                        crate_config.name, current_count, expected_docs);
+                } else {
+                    eprintln!("  ✅ {}: {} docs in DB >= {} expected", 
+                        crate_config.name, current_count, expected_docs);
+                }
+            }
         }
-    }).collect();
 
-    let loaded_crates = try_join_all(load_tasks).await?;
-    let total_load_time = start_time.elapsed();
-
-    // Convert to the format expected by the server
-    let mut all_documents = Vec::new();
-    let mut all_embeddings = Vec::new();
-    let mut crate_document_counts = HashMap::new();
-
-    for (crate_name, crate_documents) in loaded_crates {
-        if crate_documents.is_empty() {
-            eprintln!("Warning: No documents found for crate '{}'", crate_name);
-            continue;
-        }
-
-        let doc_count = crate_documents.len();
-        crate_document_counts.insert(crate_name.clone(), doc_count);
-
-        for (doc_path, content, embedding) in crate_documents {
-            // Prefix the doc path with crate name to avoid conflicts
-            let prefixed_path = format!("{}/{}", crate_name, doc_path);
-
-            all_documents.push(Document {
-                path: prefixed_path.clone(),
-                content,
-            });
-            all_embeddings.push((prefixed_path, embedding));
+        if !needs_backfill.is_empty() {
+            eprintln!("\n🔄 Automatic backfill required for {} crates:", needs_backfill.len());
+            for (crate_name, current, expected, features) in &needs_backfill {
+                eprintln!("  📦 {}: {} -> {} docs", crate_name, current, expected);
+                if let Some(features) = features {
+                    eprintln!("     Features: {:?}", features);
+                }
+            }
+            
+            eprintln!("\n💡 To trigger backfill, run:");
+            for (crate_name, _, _, features) in &needs_backfill {
+                if let Some(features) = features {
+                    eprintln!("  cargo run --bin populate_db -- --crate-name {} --features {}", 
+                        crate_name, features.join(","));
+                } else {
+                    eprintln!("  cargo run --bin populate_db -- --crate-name {}", crate_name);
+                }
+            }
+            eprintln!("⚠️  Server will continue with current document counts");
+        } else {
+            eprintln!("✅ All crates have sufficient documentation in database");
         }
     }
 
-    let total_docs = all_documents.len();
-    let total_embeddings = all_embeddings.len();
+    // Verify crates exist in database (no loading into memory)
+    eprintln!("🔍 Verifying {} crates are available in database...", crate_names.len());
+    let mut crate_stats = HashMap::new();
+    
+    for crate_name in &crate_names {
+        let stats = db.get_crate_stats().await?;
+        let crate_stat = stats.iter().find(|s| &s.name == crate_name);
+        if let Some(stat) = crate_stat {
+            crate_stats.insert(crate_name.clone(), stat.total_docs);
+            eprintln!("  ✅ {}: {} documents available", crate_name, stat.total_docs);
+        } else {
+            eprintln!("  ❌ {}: not found in database", crate_name);
+        }
+    }
 
-    // Calculate total content size
-    let total_content_size: usize = all_documents.iter().map(|doc| doc.content.len()).sum();
-    let avg_doc_size = if total_docs > 0 { total_content_size / total_docs } else { 0 };
-
-    eprintln!("\n📊 Loading Summary:");
-    eprintln!("  ⏱️  Total loading time: {:.2}s", total_load_time.as_secs_f64());
-    eprintln!("  📚 Total documents: {}", total_docs);
-    eprintln!("  🧮 Total embeddings: {}", total_embeddings);
-    eprintln!("  📄 Total content: {:.1} KB (avg: {:.1} KB/doc)",
-        total_content_size as f64 / 1024.0, avg_doc_size as f64 / 1024.0);
+    let total_available_docs: i64 = crate_stats.values().map(|&v| v as i64).sum();
+    
+    eprintln!("\n📊 Database Summary:");
+    eprintln!("  📚 Total available documents: {}", total_available_docs);
+    eprintln!("  🗄️  Database-driven search (no memory loading)");
 
     let startup_message = if crate_names.len() == 1 {
+        let doc_count = crate_stats.get(&crate_names[0]).unwrap_or(&0);
         format!(
-            "Server for crate '{}' initialized. Loaded {} documents from database.",
-            crate_names[0], total_docs
+            "Server for crate '{}' initialized. {} documents available via database search.",
+            crate_names[0], doc_count
         )
     } else {
-        let crate_summary: Vec<String> = crate_document_counts
+        let crate_summary: Vec<String> = crate_stats
             .iter()
             .map(|(name, count)| format!("{} ({})", name, count))
             .collect();
         format!(
-            "Multi-crate server initialized. Loaded {} total documents from {} crates: {}",
-            total_docs,
+            "Multi-crate server initialized. {} total documents available from {} crates: {}",
+            total_available_docs,
             crate_names.len(),
             crate_summary.join(", ")
         )
@@ -252,7 +293,7 @@ async fn main() -> Result<(), ServerError> {
 
     eprintln!("\n✅ {}", startup_message);
 
-    // Create the service instance with combined data
+    // Create the service instance (no documents/embeddings in memory)
     let combined_crate_name = if crate_names.len() == 1 {
         crate_names[0].clone()
     } else {
@@ -261,8 +302,8 @@ async fn main() -> Result<(), ServerError> {
 
     let service = RustDocsServer::new(
         combined_crate_name.clone(),
-        all_documents,
-        all_embeddings,
+        vec![], // No documents in memory - use database search
+        vec![], // No embeddings in memory - generate on demand
         db,
         startup_message,
     )?;

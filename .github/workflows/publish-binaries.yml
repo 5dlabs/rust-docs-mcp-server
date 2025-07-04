@@ -1,0 +1,121 @@
+name: Publish Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    name: Build - ${{ matrix.platform.name }}
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin_name: rustdocs_mcp_server
+            
+          - name: Linux-aarch64
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            bin_name: rustdocs_mcp_server
+            
+          - name: macOS-x86_64
+            os: macos-latest
+            target: x86_64-apple-darwin
+            bin_name: rustdocs_mcp_server
+            
+          - name: macOS-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            bin_name: rustdocs_mcp_server
+            
+          - name: Windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: rustdocs_mcp_server.exe
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform.target }}
+      
+      - name: Install cross-compilation tools
+        if: matrix.platform.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      
+      - name: Build binary
+        run: |
+          cargo build --release --target ${{ matrix.platform.target }} --bin rustdocs_mcp_server
+          cargo build --release --target ${{ matrix.platform.target }} --bin mcp_http_wrapper
+          cargo build --release --target ${{ matrix.platform.target }} --bin http_server
+          cargo build --release --target ${{ matrix.platform.target }} --bin populate_db
+          cargo build --release --target ${{ matrix.platform.target }} --bin populate_all
+          cargo build --release --target ${{ matrix.platform.target }} --bin add_crate
+          cargo build --release --target ${{ matrix.platform.target }} --bin backfill_versions
+      
+      - name: Package binaries
+        shell: bash
+        run: |
+          cd target/${{ matrix.platform.target }}/release
+          
+          # Create archive directory
+          mkdir -p rust-docs-mcp-server
+          
+          # Copy binaries
+          cp rustdocs_mcp_server rust-docs-mcp-server/ || cp rustdocs_mcp_server.exe rust-docs-mcp-server/
+          cp mcp_http_wrapper rust-docs-mcp-server/ || cp mcp_http_wrapper.exe rust-docs-mcp-server/
+          cp http_server rust-docs-mcp-server/ || cp http_server.exe rust-docs-mcp-server/
+          cp populate_db rust-docs-mcp-server/ || cp populate_db.exe rust-docs-mcp-server/
+          cp populate_all rust-docs-mcp-server/ || cp populate_all.exe rust-docs-mcp-server/
+          cp add_crate rust-docs-mcp-server/ || cp add_crate.exe rust-docs-mcp-server/
+          cp backfill_versions rust-docs-mcp-server/ || cp backfill_versions.exe rust-docs-mcp-server/
+          
+          # Copy supporting files from repo root
+          cp ../../../README.md rust-docs-mcp-server/
+          cp ../../../proxy-config.json rust-docs-mcp-server/
+          cp ../../../run_mcp_server.sh rust-docs-mcp-server/ || true
+          
+          # Create archive
+          if [[ "${{ matrix.platform.os }}" == "windows-latest" ]]; then
+            7z a ../../../rust-docs-mcp-server-${{ matrix.platform.name }}.zip rust-docs-mcp-server
+          else
+            tar czf ../../../rust-docs-mcp-server-${{ matrix.platform.name }}.tar.gz rust-docs-mcp-server
+          fi
+      
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-docs-mcp-server-${{ matrix.platform.name }}
+          path: |
+            rust-docs-mcp-server-*.tar.gz
+            rust-docs-mcp-server-*.zip
+  
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: artifacts/**/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
