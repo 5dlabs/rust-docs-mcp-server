@@ -47,7 +47,7 @@ path = "src/bin/minimal_test.rs"
 rmcp = { version = "0.1.5", features = ["transport-io", "macros", "server", "transport-sse", "transport-sse-server"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util"] }
 tokio-util = "0.7"
-reqwest = { version = "0.12.12", features = ["json"] }
+reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 dotenvy = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -68,7 +68,7 @@ anyhow = "1.0.97"
 schemars = "0.8.22"
 clap = { version = "4.5.34", features = ["cargo", "derive", "env"] }
 regex = "1.11.1"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-native-tls", "postgres", "macros", "chrono", "uuid"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "macros", "chrono", "uuid"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 chrono = "0.4"
 axum = { version = "0.8.4", features = ["http2", "json", "tokio"] }
